@@ -120,6 +120,48 @@ describe("command explainer tree-sitter runtime", () => {
     );
   });
 
+  it("normalizes static shell words before classifying commands", async () => {
+    const quotedCommand = await explainShellCommand("e'c'ho a\\ b \"c d\"");
+    expect(quotedCommand.topLevelCommands).toEqual([
+      expect.objectContaining({ executable: "echo", argv: ["echo", "a b", "c d"] }),
+    ]);
+
+    const ansiCString = await explainShellCommand("$'ec\\x68o' hi");
+    expect(ansiCString.topLevelCommands).toEqual([
+      expect.objectContaining({ executable: "echo", argv: ["echo", "hi"] }),
+    ]);
+
+    const wrappedShell = await explainShellCommand("b'a'sh -lc 'echo hi'");
+    expect(wrappedShell.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "shell-wrapper",
+        executable: "bash",
+        flag: "-lc",
+        payload: "echo hi",
+      }),
+    );
+  });
+
+  it("does not normalize dynamic executable names into trusted commands", async () => {
+    const dynamicPrefix = await explainShellCommand("e${CMD}ho hi");
+    expect(dynamicPrefix.topLevelCommands).toEqual([]);
+    expect(dynamicPrefix.risks).toContainEqual(
+      expect.objectContaining({ kind: "dynamic-executable", text: "e${CMD}ho" }),
+    );
+
+    const dynamicQuoted = await explainShellCommand('"${CMD}" hi');
+    expect(dynamicQuoted.topLevelCommands).toEqual([]);
+    expect(dynamicQuoted.risks).toContainEqual(
+      expect.objectContaining({ kind: "dynamic-executable", text: '"${CMD}"' }),
+    );
+
+    const invalidObfuscation = await explainShellCommand("e'c'h'o hi");
+    expect(invalidObfuscation.ok).toBe(false);
+    expect(invalidObfuscation.risks).toContainEqual(
+      expect.objectContaining({ kind: "syntax-error" }),
+    );
+  });
+
   it("detects command carriers", async () => {
     const find = await explainShellCommand('find . -name "*.ts" -exec grep -n TODO {} +');
     expect(find.risks).toContainEqual(

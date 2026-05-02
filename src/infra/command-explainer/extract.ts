@@ -44,14 +44,213 @@ function spanFromNode(node: TreeSitterNode): SourceSpan {
   };
 }
 
-function unquote(text: string): string {
-  if (
-    (text.startsWith('"') && text.endsWith('"')) ||
-    (text.startsWith("'") && text.endsWith("'"))
-  ) {
-    return text.slice(1, -1);
+type ShellWordValue = { kind: "literal"; value: string } | { kind: "dynamic" };
+
+const DYNAMIC_WORD_NODE_TYPES = new Set([
+  "arithmetic_expansion",
+  "command_substitution",
+  "expansion",
+  "process_substitution",
+  "simple_expansion",
+]);
+
+const COMMAND_ARGUMENT_NODE_TYPES = new Set([
+  "ansi_c_string",
+  "arithmetic_expansion",
+  "command_substitution",
+  "concatenation",
+  "expansion",
+  "process_substitution",
+  "raw_string",
+  "simple_expansion",
+  "string",
+  "word",
+]);
+
+function decodeUnquotedShellText(text: string): string {
+  let output = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    const next = text[index + 1];
+    if (ch === "\\" && next !== undefined) {
+      if (next === "\r" && text[index + 2] === "\n") {
+        index += 2;
+        continue;
+      }
+      if (next === "\n" || next === "\r") {
+        index += 1;
+        continue;
+      }
+      output += next;
+      index += 1;
+      continue;
+    }
+    output += ch;
   }
-  return text;
+  return output;
+}
+
+function decodeDoubleQuotedText(text: string): string {
+  const body = text.startsWith('"') && text.endsWith('"') ? text.slice(1, -1) : text;
+  let output = "";
+  for (let index = 0; index < body.length; index += 1) {
+    const ch = body[index];
+    const next = body[index + 1];
+    if (ch === "\\" && next !== undefined) {
+      if (next === "\r" && body[index + 2] === "\n") {
+        index += 2;
+        continue;
+      }
+      if (["\\", '"', "$", "`", "\n", "\r"].includes(next)) {
+        if (next !== "\n" && next !== "\r") {
+          output += next;
+        }
+        index += 1;
+        continue;
+      }
+    }
+    output += ch;
+  }
+  return output;
+}
+
+function decodeAnsiCString(text: string): string {
+  const body = text.startsWith("$'") && text.endsWith("'") ? text.slice(2, -1) : text;
+  let output = "";
+  for (let index = 0; index < body.length; index += 1) {
+    const ch = body[index];
+    if (ch !== "\\") {
+      output += ch;
+      continue;
+    }
+
+    const next = body[index + 1];
+    if (next === undefined) {
+      output += "\\";
+      continue;
+    }
+
+    const simpleEscapes: Record<string, string> = {
+      "'": "'",
+      '"': '"',
+      "?": "?",
+      "\\": "\\",
+      a: "\u0007",
+      b: "\b",
+      e: "\u001B",
+      E: "\u001B",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+      v: "\v",
+    };
+    const simple = simpleEscapes[next];
+    if (simple !== undefined) {
+      output += simple;
+      index += 1;
+      continue;
+    }
+
+    if (next === "x") {
+      const hex = body.slice(index + 2).match(/^[0-9A-Fa-f]{1,2}/)?.[0] ?? "";
+      if (hex) {
+        output += String.fromCodePoint(Number.parseInt(hex, 16));
+        index += 1 + hex.length;
+        continue;
+      }
+    }
+
+    if (next === "u" || next === "U") {
+      const maxLength = next === "u" ? 4 : 8;
+      const hex =
+        body.slice(index + 2).match(new RegExp(`^[0-9A-Fa-f]{1,${maxLength}}`))?.[0] ?? "";
+      if (hex) {
+        const codePoint = Number.parseInt(hex, 16);
+        try {
+          output += String.fromCodePoint(codePoint);
+        } catch {
+          output += `\\${next}${hex}`;
+        }
+        index += 1 + hex.length;
+        continue;
+      }
+    }
+
+    if (/^[0-7]$/.test(next)) {
+      const octal = body.slice(index + 1).match(/^[0-7]{1,3}/)?.[0] ?? "";
+      if (octal) {
+        output += String.fromCodePoint(Number.parseInt(octal, 8));
+        index += octal.length;
+        continue;
+      }
+    }
+
+    output += next;
+    index += 1;
+  }
+  return output;
+}
+
+function hasDynamicWordPart(node: TreeSitterNode): boolean {
+  return (
+    DYNAMIC_WORD_NODE_TYPES.has(node.type) ||
+    namedChildren(node).some((child) => hasDynamicWordPart(child))
+  );
+}
+
+function shellWordValue(node: TreeSitterNode): ShellWordValue {
+  if (DYNAMIC_WORD_NODE_TYPES.has(node.type)) {
+    return { kind: "dynamic" };
+  }
+  if (
+    node.type !== "command_name" &&
+    node.type !== "concatenation" &&
+    namedChildren(node).some((child) => hasDynamicWordPart(child))
+  ) {
+    return { kind: "dynamic" };
+  }
+
+  switch (node.type) {
+    case "command_name": {
+      const parts = namedChildren(node);
+      if (parts.length === 0) {
+        return { kind: "literal", value: decodeUnquotedShellText(node.text) };
+      }
+      let value = "";
+      for (const part of parts) {
+        const partValue = shellWordValue(part);
+        if (partValue.kind !== "literal") {
+          return { kind: "dynamic" };
+        }
+        value += partValue.value;
+      }
+      return { kind: "literal", value };
+    }
+    case "word":
+      return { kind: "literal", value: decodeUnquotedShellText(node.text) };
+    case "raw_string":
+      return { kind: "literal", value: node.text.slice(1, -1) };
+    case "string":
+      return { kind: "literal", value: decodeDoubleQuotedText(node.text) };
+    case "ansi_c_string":
+      return { kind: "literal", value: decodeAnsiCString(node.text) };
+    case "concatenation": {
+      let value = "";
+      for (const child of namedChildren(node)) {
+        const childValue = shellWordValue(child);
+        if (childValue.kind !== "literal") {
+          return { kind: "dynamic" };
+        }
+        value += childValue.value;
+      }
+      return { kind: "literal", value };
+    }
+    default:
+      return namedChildren(node).some((child) => shellWordValue(child).kind === "dynamic")
+        ? { kind: "dynamic" }
+        : { kind: "literal", value: decodeUnquotedShellText(node.text) };
+  }
 }
 
 function commandNameNode(node: TreeSitterNode): TreeSitterNode | null {
@@ -62,30 +261,25 @@ function commandNameNode(node: TreeSitterNode): TreeSitterNode | null {
   );
 }
 
-function nodeContainsType(node: TreeSitterNode | null, type: string): boolean {
-  if (!node) {
-    return false;
+function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): string[] | null {
+  const executable = shellWordValue(nameNode);
+  if (executable.kind !== "literal") {
+    return null;
   }
-  if (node.type === type) {
-    return true;
-  }
-  return namedChildren(node).some((child) => nodeContainsType(child, type));
-}
 
-function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): string[] {
   const skipped = new Set<TreeSitterNode>([nameNode, ...namedChildren(nameNode)]);
-  const argv = [unquote(nameNode.text)];
+  const argv = [executable.value];
   for (const child of namedChildren(node)) {
     if (
       skipped.has(child) ||
       child.type === "command_name" ||
-      child.type === "variable_assignment"
+      child.type === "variable_assignment" ||
+      !COMMAND_ARGUMENT_NODE_TYPES.has(child.type)
     ) {
       continue;
     }
-    if (["word", "string", "raw_string", "concatenation"].includes(child.type)) {
-      argv.push(unquote(child.text));
-    }
+    const value = shellWordValue(child);
+    argv.push(value.kind === "literal" ? value.value : child.text);
   }
   return argv;
 }
@@ -235,17 +429,14 @@ function walk(node: TreeSitterNode, output: MutableExplanation, context: Command
   if (node.type === "command") {
     const nameNode = commandNameNode(node);
     if (nameNode) {
-      const hasDynamicName =
-        nodeContainsType(nameNode, "command_substitution") ||
-        nodeContainsType(nameNode, "process_substitution");
-      if (hasDynamicName) {
+      const argv = argvFromCommand(node, nameNode);
+      if (!argv) {
         output.risks.push({
           kind: "dynamic-executable",
           text: nameNode.text,
           span: spanFromNode(nameNode),
         });
       } else {
-        const argv = argvFromCommand(node, nameNode);
         const step: CommandStep = {
           context,
           executable: argv[0] ?? "",
