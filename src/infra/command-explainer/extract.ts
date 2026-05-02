@@ -18,6 +18,8 @@ type MutableExplanation = {
 };
 
 const SHELL_EXECUTABLES = new Set(["bash", "sh", "zsh", "dash"]);
+const SHELL_CARRIER_EXECUTABLES = new Set(["sudo", "doas", "env", "command", "builtin"]);
+const SOURCE_EXECUTABLES = new Set([".", "source"]);
 
 function children(node: TreeSitterNode): TreeSitterNode[] {
   return Array.from({ length: node.childCount }, (_, index) => node.child(index)).filter(
@@ -66,6 +68,27 @@ const COMMAND_ARGUMENT_NODE_TYPES = new Set([
   "string",
   "word",
 ]);
+
+function hasEscapedLineContinuation(text: string): boolean {
+  return /\\(?:\r\n|[\r\n])/.test(text);
+}
+
+function hasUnescapedGlobPattern(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index];
+    if (ch === "\\") {
+      index += 1;
+      continue;
+    }
+    if (ch === "*" || ch === "?") {
+      return true;
+    }
+    if (ch === "[" && text.indexOf("]", index + 1) > index + 1) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function decodeUnquotedShellText(text: string): string {
   let output = "";
@@ -228,7 +251,9 @@ function shellWordValue(node: TreeSitterNode): ShellWordValue {
       return { kind: "literal", value };
     }
     case "word":
-      return { kind: "literal", value: decodeUnquotedShellText(node.text) };
+      return hasUnescapedGlobPattern(node.text)
+        ? { kind: "dynamic" }
+        : { kind: "literal", value: decodeUnquotedShellText(node.text) };
     case "raw_string":
       return { kind: "literal", value: node.text.slice(1, -1) };
     case "string":
@@ -262,6 +287,9 @@ function commandNameNode(node: TreeSitterNode): TreeSitterNode | null {
 }
 
 function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): string[] | null {
+  if (hasEscapedLineContinuation(node.text)) {
+    return null;
+  }
   const executable = shellWordValue(nameNode);
   if (executable.kind !== "literal") {
     return null;
@@ -390,7 +418,13 @@ function recordCommandRisks(
   if (normalizedExecutable === "eval") {
     output.risks.push({ kind: "eval", text, span });
   }
-  if (["sudo", "doas", "env"].includes(normalizedExecutable)) {
+  if (SOURCE_EXECUTABLES.has(normalizedExecutable)) {
+    output.risks.push({ kind: "source", command: normalizedExecutable, text, span });
+  }
+  if (normalizedExecutable === "alias") {
+    output.risks.push({ kind: "alias", text, span });
+  }
+  if (SHELL_CARRIER_EXECUTABLES.has(normalizedExecutable)) {
     const shellIndex = argv.findIndex((arg) =>
       SHELL_EXECUTABLES.has(normalizeExecutableToken(arg)),
     );
@@ -398,6 +432,24 @@ function recordCommandRisks(
       output.risks.push({
         kind: "shell-wrapper-through-carrier",
         command: normalizedExecutable,
+        text,
+        span,
+      });
+    }
+
+    const carriedCommand = argv.slice(1).find((arg) => {
+      const normalized = normalizeExecutableToken(arg);
+      return normalized === "eval" || SOURCE_EXECUTABLES.has(normalized);
+    });
+    const normalizedCarriedCommand = carriedCommand
+      ? normalizeExecutableToken(carriedCommand)
+      : undefined;
+    if (normalizedCarriedCommand === "eval") {
+      output.risks.push({ kind: "eval", text, span });
+    } else if (normalizedCarriedCommand && SOURCE_EXECUTABLES.has(normalizedCarriedCommand)) {
+      output.risks.push({
+        kind: "source",
+        command: normalizedCarriedCommand,
         text,
         span,
       });
@@ -410,7 +462,20 @@ function walk(node: TreeSitterNode, output: MutableExplanation, context: Command
 
   const span = spanFromNode(node);
   let childContext = context;
-  if (node.type === "command_substitution") {
+  if (node.type === "program" && hasEscapedLineContinuation(node.text)) {
+    output.risks.push({ kind: "line-continuation", text: node.text, span });
+  }
+
+  if (node.type === "function_definition") {
+    const nameNode = node.childForFieldName("name");
+    output.risks.push({
+      kind: "function-definition",
+      name: nameNode?.text ?? "",
+      text: node.text,
+      span,
+    });
+    childContext = "function-definition";
+  } else if (node.type === "command_substitution") {
     output.risks.push({ kind: "command-substitution", text: node.text, span });
     childContext = "command-substitution";
   } else if (node.type === "process_substitution") {

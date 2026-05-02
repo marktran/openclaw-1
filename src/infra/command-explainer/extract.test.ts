@@ -155,6 +155,21 @@ describe("command explainer tree-sitter runtime", () => {
       expect.objectContaining({ kind: "dynamic-executable", text: '"${CMD}"' }),
     );
 
+    const dynamicGlob = await explainShellCommand("./ec* hi");
+    expect(dynamicGlob.topLevelCommands).toEqual([]);
+    expect(dynamicGlob.risks).toContainEqual(
+      expect.objectContaining({ kind: "dynamic-executable", text: "./ec*" }),
+    );
+
+    const lineContinuation = await explainShellCommand("ec\\\nho hi");
+    expect(lineContinuation.topLevelCommands).toEqual([]);
+    expect(lineContinuation.risks).toContainEqual(
+      expect.objectContaining({ kind: "line-continuation" }),
+    );
+    expect(lineContinuation.risks).toContainEqual(
+      expect.objectContaining({ kind: "dynamic-executable" }),
+    );
+
     const invalidObfuscation = await explainShellCommand("e'c'h'o hi");
     expect(invalidObfuscation.ok).toBe(false);
     expect(invalidObfuscation.risks).toContainEqual(
@@ -174,18 +189,48 @@ describe("command explainer tree-sitter runtime", () => {
     );
   });
 
-  it("detects eval and sudo shell wrappers", async () => {
+  it("detects eval, source, aliases, and carrier shell wrappers", async () => {
     const evalCommand = await explainShellCommand('eval "$OPENCLAW_CMD"');
     expect(evalCommand.risks).toContainEqual(expect.objectContaining({ kind: "eval" }));
+
+    const builtinEval = await explainShellCommand("builtin eval 'echo hi'");
+    expect(builtinEval.risks).toContainEqual(expect.objectContaining({ kind: "eval" }));
+
+    const sourceCommand = await explainShellCommand(". ./some-script.sh");
+    expect(sourceCommand.risks).toContainEqual(
+      expect.objectContaining({ kind: "source", command: "." }),
+    );
+
+    const aliasCommand = await explainShellCommand("alias ll='ls -l'");
+    expect(aliasCommand.risks).toContainEqual(expect.objectContaining({ kind: "alias" }));
 
     const sudoShell = await explainShellCommand('sudo sh -c "id && whoami"');
     expect(sudoShell.risks).toContainEqual(
       expect.objectContaining({ kind: "shell-wrapper-through-carrier", command: "sudo" }),
     );
 
+    const commandShell = await explainShellCommand("command bash -lc 'id && whoami'");
+    expect(commandShell.risks).toContainEqual(
+      expect.objectContaining({ kind: "shell-wrapper-through-carrier", command: "command" }),
+    );
+
     const sudoCombinedFlags = await explainShellCommand('sudo bash -euxc "id && whoami"');
     expect(sudoCombinedFlags.risks).toContainEqual(
       expect.objectContaining({ kind: "shell-wrapper-through-carrier", command: "sudo" }),
+    );
+  });
+
+  it("treats function bodies as nested command context", async () => {
+    const explanation = await explainShellCommand("ls() { echo hi; }; ls /tmp");
+
+    expect(explanation.topLevelCommands).toEqual([
+      expect.objectContaining({ context: "top-level", executable: "ls", argv: ["ls", "/tmp"] }),
+    ]);
+    expect(explanation.nestedCommands).toEqual([
+      expect.objectContaining({ context: "function-definition", executable: "echo" }),
+    ]);
+    expect(explanation.risks).toContainEqual(
+      expect.objectContaining({ kind: "function-definition", name: "ls" }),
     );
   });
 

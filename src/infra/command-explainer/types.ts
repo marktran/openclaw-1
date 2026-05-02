@@ -3,7 +3,8 @@ export type CommandContext =
   | "command-substitution"
   | "process-substitution"
   | "wrapper-payload"
-  | "command-carrier";
+  | "command-carrier"
+  | "function-definition";
 
 export type CommandShape =
   | "pipeline"
@@ -48,6 +49,10 @@ export type CommandRisk =
   | { kind: "process-substitution"; text: string; span: SourceSpan }
   | { kind: "dynamic-executable"; text: string; span: SourceSpan }
   | { kind: "eval"; text: string; span: SourceSpan }
+  | { kind: "source"; command: string; text: string; span: SourceSpan }
+  | { kind: "alias"; text: string; span: SourceSpan }
+  | { kind: "function-definition"; name: string; text: string; span: SourceSpan }
+  | { kind: "line-continuation"; text: string; span: SourceSpan }
   | { kind: "heredoc"; text: string; span: SourceSpan }
   | { kind: "here-string"; text: string; span: SourceSpan }
   | { kind: "redirect"; text: string; span: SourceSpan }
