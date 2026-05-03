@@ -2,8 +2,6 @@ export type CommandContext =
   | "top-level"
   | "command-substitution"
   | "process-substitution"
-  | "wrapper-payload"
-  | "command-carrier"
   | "function-definition";
 
 export type CommandShape =
@@ -16,7 +14,8 @@ export type CommandShape =
   | "while"
   | "case"
   | "subshell"
-  | "group";
+  | "group"
+  | "background";
 
 export type SourceSpan = {
   startIndex: number;
@@ -48,6 +47,13 @@ export type CommandRisk =
   | { kind: "command-substitution"; text: string; span: SourceSpan }
   | { kind: "process-substitution"; text: string; span: SourceSpan }
   | { kind: "dynamic-executable"; text: string; span: SourceSpan }
+  | {
+      kind: "dynamic-argument";
+      command: string;
+      argumentIndex: number;
+      text: string;
+      span: SourceSpan;
+    }
   | { kind: "eval"; text: string; span: SourceSpan }
   | { kind: "source"; command: string; text: string; span: SourceSpan }
   | { kind: "alias"; text: string; span: SourceSpan }

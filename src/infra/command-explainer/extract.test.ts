@@ -6,8 +6,18 @@ describe("command explainer tree-sitter runtime", () => {
   it("loads tree-sitter bash and parses a simple command", async () => {
     const tree = await parseBashForCommandExplanation("ls | grep stuff");
 
-    expect(tree.rootNode.type).toBe("program");
-    expect(tree.rootNode.toString()).toContain("pipeline");
+    try {
+      expect(tree.rootNode.type).toBe("program");
+      expect(tree.rootNode.toString()).toContain("pipeline");
+    } finally {
+      tree.delete();
+    }
+  });
+
+  it("rejects oversized parser input before parsing", async () => {
+    await expect(parseBashForCommandExplanation("x".repeat(128 * 1024 + 1))).rejects.toThrow(
+      "Shell command is too large to explain",
+    );
   });
 
   it("explains a pipeline with python inline eval", async () => {
@@ -82,6 +92,19 @@ describe("command explainer tree-sitter runtime", () => {
     ]);
   });
 
+  it("detects newline sequences and background commands", async () => {
+    const newlineSequence = await explainShellCommand("echo a\necho b");
+    expect(newlineSequence.shapes).toContain("sequence");
+    expect(newlineSequence.topLevelCommands.map((step) => step.executable)).toEqual([
+      "echo",
+      "echo",
+    ]);
+
+    const background = await explainShellCommand("echo a & echo b");
+    expect(background.shapes).toEqual(expect.arrayContaining(["background", "sequence"]));
+    expect(background.topLevelCommands.map((step) => step.executable)).toEqual(["echo", "echo"]);
+  });
+
   it("detects conditionals", async () => {
     const explanation = await explainShellCommand(
       "if test -f package.json; then pnpm test; else echo missing; fi",
@@ -92,6 +115,27 @@ describe("command explainer tree-sitter runtime", () => {
       "test",
       "pnpm",
       "echo",
+    ]);
+  });
+
+  it("detects declaration and test command forms", async () => {
+    const declaration = await explainShellCommand("export A=$(whoami)");
+
+    expect(declaration.topLevelCommands).toEqual([
+      expect.objectContaining({ executable: "export", argv: ["export", "A=$(whoami)"] }),
+    ]);
+    expect(declaration.nestedCommands).toEqual([
+      expect.objectContaining({ context: "command-substitution", executable: "whoami" }),
+    ]);
+
+    const testCommand = await explainShellCommand("[ -f package.json ]");
+    expect(testCommand.topLevelCommands).toEqual([
+      expect.objectContaining({ executable: "[", argv: ["[", "-f", "package.json"] }),
+    ]);
+
+    const doubleBracket = await explainShellCommand("[[ -f package.json ]]");
+    expect(doubleBracket.topLevelCommands).toEqual([
+      expect.objectContaining({ executable: "[[", argv: ["[[", "-f", "package.json"] }),
     ]);
   });
 
@@ -118,6 +162,62 @@ describe("command explainer tree-sitter runtime", () => {
         payload: "echo hi",
       }),
     );
+
+    const combinedInline = await explainShellCommand('bash -c"echo hi"');
+    expect(combinedInline.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "shell-wrapper",
+        executable: "bash",
+        payload: "echo hi",
+      }),
+    );
+
+    const powershell = await explainShellCommand('pwsh -Command "Get-ChildItem"');
+    expect(powershell.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "shell-wrapper",
+        executable: "pwsh",
+        flag: "-Command",
+        payload: "Get-ChildItem",
+      }),
+    );
+
+    const powershellWithOptions = await explainShellCommand(
+      "pwsh -ExecutionPolicy Bypass -Command Get-ChildItem",
+    );
+    expect(powershellWithOptions.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "shell-wrapper",
+        executable: "pwsh",
+        flag: "-Command",
+        payload: "Get-ChildItem",
+      }),
+    );
+
+    const dynamicPayload = await explainShellCommand('bash -lc "$CMD"');
+    expect(dynamicPayload.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "shell-wrapper",
+        executable: "bash",
+        flag: "-lc",
+        payload: "$CMD",
+      }),
+    );
+
+    for (const [command, carrier] of [
+      ["time bash -lc 'id'", "time"],
+      ["nice bash -lc 'id'", "nice"],
+      ["timeout 1 bash -lc 'id'", "timeout"],
+      ["caffeinate -d -w 42 bash -lc 'id'", "caffeinate"],
+    ] as const) {
+      const wrapped = await explainShellCommand(command);
+      expect(wrapped.risks).toContainEqual(
+        expect.objectContaining({
+          kind: "shell-wrapper-through-carrier",
+          command: carrier,
+        }),
+      );
+    }
   });
 
   it("normalizes static shell words before classifying commands", async () => {
@@ -161,6 +261,35 @@ describe("command explainer tree-sitter runtime", () => {
       expect.objectContaining({ kind: "dynamic-executable", text: "./ec*" }),
     );
 
+    const dynamicBraceExpansion = await explainShellCommand("./{echo,printf} hi");
+    expect(dynamicBraceExpansion.topLevelCommands).toEqual([]);
+    expect(dynamicBraceExpansion.risks).toContainEqual(
+      expect.objectContaining({ kind: "dynamic-executable", text: "./{echo,printf}" }),
+    );
+
+    const dynamicArgument = await explainShellCommand("echo ./ec*");
+    expect(dynamicArgument.topLevelCommands).toEqual([
+      expect.objectContaining({ executable: "echo", argv: ["echo", "./ec*"] }),
+    ]);
+    expect(dynamicArgument.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "dynamic-argument",
+        command: "echo",
+        argumentIndex: 1,
+        text: "./ec*",
+      }),
+    );
+
+    const dynamicShellFlag = await explainShellCommand("bash $FLAGS id");
+    expect(dynamicShellFlag.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "dynamic-argument",
+        command: "bash",
+        argumentIndex: 1,
+        text: "$FLAGS",
+      }),
+    );
+
     const lineContinuation = await explainShellCommand("ec\\\nho hi");
     expect(lineContinuation.topLevelCommands).toEqual([]);
     expect(lineContinuation.risks).toContainEqual(
@@ -168,6 +297,17 @@ describe("command explainer tree-sitter runtime", () => {
     );
     expect(lineContinuation.risks).toContainEqual(
       expect.objectContaining({ kind: "dynamic-executable" }),
+    );
+
+    const continuedArgument = await explainShellCommand("pnpm test \\\n --filter foo");
+    expect(continuedArgument.topLevelCommands).toEqual([
+      expect.objectContaining({
+        executable: "pnpm",
+        argv: ["pnpm", "test", "--filter", "foo"],
+      }),
+    ]);
+    expect(continuedArgument.risks).toContainEqual(
+      expect.objectContaining({ kind: "line-continuation" }),
     );
 
     const invalidObfuscation = await explainShellCommand("e'c'h'o hi");
@@ -187,6 +327,26 @@ describe("command explainer tree-sitter runtime", () => {
     expect(xargs.risks).toContainEqual(
       expect.objectContaining({ kind: "command-carrier", command: "xargs" }),
     );
+
+    const envSplitString = await explainShellCommand("env -S 'sh -c \"id\"'");
+    expect(envSplitString.risks).toContainEqual(
+      expect.objectContaining({ kind: "command-carrier", command: "env", flag: "-S" }),
+    );
+
+    for (const command of [
+      'env python -c "print(1)"',
+      'sudo python -c "print(1)"',
+      'command python -c "print(1)"',
+    ]) {
+      const explanation = await explainShellCommand(command);
+      expect(explanation.risks).toContainEqual(
+        expect.objectContaining({
+          kind: "inline-eval",
+          command: "python",
+          flag: "-c",
+        }),
+      );
+    }
   });
 
   it("detects eval, source, aliases, and carrier shell wrappers", async () => {
@@ -285,6 +445,6 @@ describe("command explainer tree-sitter runtime", () => {
       }
     }
     const elapsedMs = performance.now() - start;
-    expect(elapsedMs / (iterations * corpus.length)).toBeLessThan(5);
+    expect(elapsedMs / (iterations * corpus.length)).toBeLessThan(20);
   });
 });

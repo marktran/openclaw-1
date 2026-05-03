@@ -1,6 +1,12 @@
 import type { Node as TreeSitterNode } from "web-tree-sitter";
+import { unwrapKnownDispatchWrapperInvocation } from "../dispatch-wrapper-resolution.js";
 import { detectInterpreterInlineEvalArgv } from "../exec-inline-eval.js";
 import { normalizeExecutableToken } from "../exec-wrapper-resolution.js";
+import {
+  extractShellWrapperCommand,
+  isShellWrapperExecutable,
+  resolveShellWrapperTransportArgv,
+} from "../shell-wrapper-resolution.js";
 import { parseBashForCommandExplanation } from "./tree-sitter-runtime.js";
 import type {
   CommandContext,
@@ -17,7 +23,17 @@ type MutableExplanation = {
   risks: CommandRisk[];
 };
 
-const SHELL_EXECUTABLES = new Set(["bash", "sh", "zsh", "dash"]);
+type DynamicArgument = {
+  index: number;
+  text: string;
+  span: SourceSpan;
+};
+
+type CommandArgv = {
+  argv: string[];
+  dynamicArguments: DynamicArgument[];
+};
+
 const SHELL_CARRIER_EXECUTABLES = new Set(["sudo", "doas", "env", "command", "builtin"]);
 const SOURCE_EXECUTABLES = new Set([".", "source"]);
 
@@ -46,7 +62,7 @@ function spanFromNode(node: TreeSitterNode): SourceSpan {
   };
 }
 
-type ShellWordValue = { kind: "literal"; value: string } | { kind: "dynamic" };
+type ShellWordValue = { kind: "literal"; value: string } | { kind: "dynamic"; value: string };
 
 const DYNAMIC_WORD_NODE_TYPES = new Set([
   "arithmetic_expansion",
@@ -62,6 +78,7 @@ const COMMAND_ARGUMENT_NODE_TYPES = new Set([
   "command_substitution",
   "concatenation",
   "expansion",
+  "number",
   "process_substitution",
   "raw_string",
   "simple_expansion",
@@ -73,7 +90,11 @@ function hasEscapedLineContinuation(text: string): boolean {
   return /\\(?:\r\n|[\r\n])/.test(text);
 }
 
-function hasUnescapedGlobPattern(text: string): boolean {
+function hasExecutableLineContinuation(text: string): boolean {
+  return /^[^\s]*\\(?:\r\n|[\r\n])/.test(text);
+}
+
+function hasUnescapedDynamicPattern(text: string): boolean {
   for (let index = 0; index < text.length; index += 1) {
     const ch = text[index];
     if (ch === "\\") {
@@ -84,6 +105,9 @@ function hasUnescapedGlobPattern(text: string): boolean {
       return true;
     }
     if (ch === "[" && text.indexOf("]", index + 1) > index + 1) {
+      return true;
+    }
+    if (ch === "{" && text.indexOf("}", index + 1) > index + 1) {
       return true;
     }
   }
@@ -224,35 +248,40 @@ function hasDynamicWordPart(node: TreeSitterNode): boolean {
 
 function shellWordValue(node: TreeSitterNode): ShellWordValue {
   if (DYNAMIC_WORD_NODE_TYPES.has(node.type)) {
-    return { kind: "dynamic" };
+    return { kind: "dynamic", value: node.text };
   }
   if (
     node.type !== "command_name" &&
     node.type !== "concatenation" &&
     namedChildren(node).some((child) => hasDynamicWordPart(child))
   ) {
-    return { kind: "dynamic" };
+    return {
+      kind: "dynamic",
+      value: node.type === "string" ? decodeDoubleQuotedText(node.text) : node.text,
+    };
   }
 
   switch (node.type) {
     case "command_name": {
       const parts = namedChildren(node);
       if (parts.length === 0) {
-        return { kind: "literal", value: decodeUnquotedShellText(node.text) };
+        return hasUnescapedDynamicPattern(node.text)
+          ? { kind: "dynamic", value: decodeUnquotedShellText(node.text) }
+          : { kind: "literal", value: decodeUnquotedShellText(node.text) };
       }
       let value = "";
       for (const part of parts) {
         const partValue = shellWordValue(part);
-        if (partValue.kind !== "literal") {
-          return { kind: "dynamic" };
-        }
         value += partValue.value;
+        if (partValue.kind !== "literal") {
+          return { kind: "dynamic", value };
+        }
       }
       return { kind: "literal", value };
     }
     case "word":
-      return hasUnescapedGlobPattern(node.text)
-        ? { kind: "dynamic" }
+      return hasUnescapedDynamicPattern(node.text)
+        ? { kind: "dynamic", value: decodeUnquotedShellText(node.text) }
         : { kind: "literal", value: decodeUnquotedShellText(node.text) };
     case "raw_string":
       return { kind: "literal", value: node.text.slice(1, -1) };
@@ -261,19 +290,23 @@ function shellWordValue(node: TreeSitterNode): ShellWordValue {
     case "ansi_c_string":
       return { kind: "literal", value: decodeAnsiCString(node.text) };
     case "concatenation": {
+      if (hasUnescapedDynamicPattern(node.text)) {
+        return { kind: "dynamic", value: decodeUnquotedShellText(node.text) };
+      }
       let value = "";
+      let dynamic = false;
       for (const child of namedChildren(node)) {
         const childValue = shellWordValue(child);
-        if (childValue.kind !== "literal") {
-          return { kind: "dynamic" };
-        }
         value += childValue.value;
+        if (childValue.kind !== "literal") {
+          dynamic = true;
+        }
       }
-      return { kind: "literal", value };
+      return dynamic ? { kind: "dynamic", value } : { kind: "literal", value };
     }
     default:
       return namedChildren(node).some((child) => shellWordValue(child).kind === "dynamic")
-        ? { kind: "dynamic" }
+        ? { kind: "dynamic", value: decodeUnquotedShellText(node.text) }
         : { kind: "literal", value: decodeUnquotedShellText(node.text) };
   }
 }
@@ -286,8 +319,8 @@ function commandNameNode(node: TreeSitterNode): TreeSitterNode | null {
   );
 }
 
-function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): string[] | null {
-  if (hasEscapedLineContinuation(node.text)) {
+function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): CommandArgv | null {
+  if (hasEscapedLineContinuation(nameNode.text) || hasExecutableLineContinuation(node.text)) {
     return null;
   }
   const executable = shellWordValue(nameNode);
@@ -297,6 +330,7 @@ function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): string
 
   const skipped = new Set<TreeSitterNode>([nameNode, ...namedChildren(nameNode)]);
   const argv = [executable.value];
+  const dynamicArguments: DynamicArgument[] = [];
   for (const child of namedChildren(node)) {
     if (
       skipped.has(child) ||
@@ -307,14 +341,85 @@ function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): string
       continue;
     }
     const value = shellWordValue(child);
-    argv.push(value.kind === "literal" ? value.value : child.text);
+    if (value.kind === "dynamic") {
+      dynamicArguments.push({ index: argv.length, text: child.text, span: spanFromNode(child) });
+    }
+    argv.push(value.value);
   }
-  return argv;
+  return { argv, dynamicArguments };
+}
+
+function firstShellToken(text: string): string {
+  return text.trimStart().match(/^\S+/)?.[0] ?? "";
+}
+
+function argvFromDeclarationCommand(node: TreeSitterNode): CommandArgv | null {
+  const executable = firstShellToken(node.text);
+  if (!executable) {
+    return null;
+  }
+  const argv = [executable];
+  const dynamicArguments: DynamicArgument[] = [];
+  for (const child of namedChildren(node)) {
+    if (!COMMAND_ARGUMENT_NODE_TYPES.has(child.type) && child.type !== "variable_assignment") {
+      continue;
+    }
+    const value = shellWordValue(child);
+    if (value.kind === "dynamic") {
+      dynamicArguments.push({ index: argv.length, text: child.text, span: spanFromNode(child) });
+    }
+    argv.push(value.value);
+  }
+  return { argv, dynamicArguments };
+}
+
+function appendTestCommandArguments(
+  node: TreeSitterNode,
+  argv: string[],
+  dynamicArguments: DynamicArgument[],
+): void {
+  if (node.type === "test_operator" || COMMAND_ARGUMENT_NODE_TYPES.has(node.type)) {
+    const value = shellWordValue(node);
+    if (value.kind === "dynamic") {
+      dynamicArguments.push({ index: argv.length, text: node.text, span: spanFromNode(node) });
+    }
+    argv.push(value.value);
+    return;
+  }
+  for (const child of namedChildren(node)) {
+    appendTestCommandArguments(child, argv, dynamicArguments);
+  }
+}
+
+function argvFromTestCommand(node: TreeSitterNode): CommandArgv | null {
+  const trimmed = node.text.trimStart();
+  const executable = trimmed.startsWith("[[") ? "[[" : trimmed.startsWith("[") ? "[" : "";
+  if (!executable) {
+    return null;
+  }
+  const argv = [executable];
+  const dynamicArguments: DynamicArgument[] = [];
+  for (const child of namedChildren(node)) {
+    appendTestCommandArguments(child, argv, dynamicArguments);
+  }
+  return { argv, dynamicArguments };
+}
+
+function isCommandLikeNode(node: TreeSitterNode): boolean {
+  return (
+    node.type === "command" || node.type === "declaration_command" || node.type === "test_command"
+  );
 }
 
 function recordShape(node: TreeSitterNode, output: MutableExplanation): void {
-  if ((node.type === "program" || node.type === "list") && hasDirectChildType(node, ";")) {
+  if (
+    (node.type === "program" || node.type === "list") &&
+    (hasDirectChildType(node, ";") || namedChildren(node).filter(isCommandLikeNode).length > 1)
+  ) {
     output.shapes.add("sequence");
+  }
+  if (hasDirectChildType(node, "&")) {
+    output.shapes.add("background");
   }
   if (node.type === "pipeline") {
     output.shapes.add("pipeline");
@@ -351,6 +456,7 @@ function shellCommandFlag(
   argv: string[],
   startIndex: number,
 ): { flag: string; index: number } | null {
+  const shell = normalizeExecutableToken(argv[startIndex - 1] ?? argv[0] ?? "");
   for (let index = startIndex; index < argv.length; index += 1) {
     const token = argv[index]?.trim();
     if (!token) {
@@ -359,18 +465,109 @@ function shellCommandFlag(
     if (token === "--") {
       break;
     }
-    if (token === "-c") {
+    const lower = token.toLowerCase();
+    if (shell === "cmd") {
+      if (lower === "/c" || lower === "/k") {
+        return { flag: token, index };
+      }
+      continue;
+    }
+    if (shell === "powershell" || shell === "pwsh") {
+      if (
+        lower === "-c" ||
+        lower === "-command" ||
+        lower === "--command" ||
+        lower === "-encodedcommand" ||
+        lower === "-enc" ||
+        lower === "-e" ||
+        lower === "-f" ||
+        lower === "-file"
+      ) {
+        return { flag: token, index };
+      }
+      continue;
+    }
+    if (lower === "-c" || lower === "--command") {
       return { flag: token, index };
     }
-    if (token.startsWith("-") && !token.startsWith("--") && token.slice(1).includes("c")) {
+    if (token.startsWith("-") && !token.startsWith("--") && lower.slice(1).includes("c")) {
       return { flag: token, index };
     }
   }
   return null;
 }
 
+type InlineEvalHit = NonNullable<ReturnType<typeof detectInterpreterInlineEvalArgv>>;
+
+function detectCarrierInlineEvalArgv(argv: string[]): InlineEvalHit | null {
+  const dispatchUnwrap = unwrapKnownDispatchWrapperInvocation(argv);
+  if (dispatchUnwrap.kind === "unwrapped") {
+    return detectInterpreterInlineEvalArgv(dispatchUnwrap.argv);
+  }
+
+  const executable = normalizeExecutableToken(argv[0] ?? "");
+  if (!SHELL_CARRIER_EXECUTABLES.has(executable)) {
+    return null;
+  }
+  for (let index = 1; index < argv.length; index += 1) {
+    const hit = detectInterpreterInlineEvalArgv(argv.slice(index));
+    if (hit) {
+      return hit;
+    }
+  }
+  return null;
+}
+
+function envSplitStringFlag(argv: string[]): string | null {
+  if (normalizeExecutableToken(argv[0] ?? "") !== "env") {
+    return null;
+  }
+  for (const arg of argv.slice(1)) {
+    const token = arg.trim();
+    if (token === "-S" || token === "--split-string") {
+      return token;
+    }
+    if (token.startsWith("--split-string=") || (token.startsWith("-S") && token.length > 2)) {
+      return token.startsWith("--") ? "--split-string" : "-S";
+    }
+  }
+  return null;
+}
+
+function recordInlineEvalRisk(
+  inlineEval: InlineEvalHit,
+  text: string,
+  span: SourceSpan,
+  output: MutableExplanation,
+): void {
+  output.risks.push({
+    kind: "inline-eval",
+    command: inlineEval.normalizedExecutable,
+    flag: inlineEval.flag,
+    text,
+    span,
+  });
+}
+
+function recordDynamicArgumentRisks(
+  command: string,
+  dynamicArguments: DynamicArgument[],
+  output: MutableExplanation,
+): void {
+  for (const argument of dynamicArguments) {
+    output.risks.push({
+      kind: "dynamic-argument",
+      command,
+      argumentIndex: argument.index,
+      text: argument.text,
+      span: argument.span,
+    });
+  }
+}
+
 function recordCommandRisks(
   argv: string[],
+  dynamicArguments: DynamicArgument[],
   text: string,
   span: SourceSpan,
   output: MutableExplanation,
@@ -380,26 +577,30 @@ function recordCommandRisks(
     return;
   }
   const normalizedExecutable = normalizeExecutableToken(executable);
-  const inlineEval = detectInterpreterInlineEvalArgv(argv);
+  recordDynamicArgumentRisks(normalizedExecutable, dynamicArguments, output);
+  const inlineEval = detectInterpreterInlineEvalArgv(argv) ?? detectCarrierInlineEvalArgv(argv);
   if (inlineEval) {
-    output.risks.push({
-      kind: "inline-eval",
-      command: inlineEval.normalizedExecutable,
-      flag: inlineEval.flag,
-      text,
-      span,
-    });
+    recordInlineEvalRisk(inlineEval, text, span, output);
   }
 
-  if (SHELL_EXECUTABLES.has(normalizedExecutable)) {
-    const commandFlag = shellCommandFlag(argv, 1);
-    const payload = commandFlag ? argv[commandFlag.index + 1] : undefined;
-    if (commandFlag && payload) {
+  const shellWrapper = extractShellWrapperCommand(argv);
+  if (shellWrapper.isWrapper && shellWrapper.command) {
+    const transportArgv = resolveShellWrapperTransportArgv(argv) ?? argv;
+    const shellExecutable = transportArgv[0] ?? executable;
+    const commandFlag = shellCommandFlag(transportArgv, 1) ?? shellCommandFlag(argv, 1);
+    if (isShellWrapperExecutable(executable)) {
       output.risks.push({
         kind: "shell-wrapper",
-        executable,
-        flag: commandFlag.flag,
-        payload,
+        executable: shellExecutable,
+        flag: commandFlag?.flag ?? "-c",
+        payload: shellWrapper.command,
+        text,
+        span,
+      });
+    } else {
+      output.risks.push({
+        kind: "shell-wrapper-through-carrier",
+        command: normalizedExecutable,
         text,
         span,
       });
@@ -415,6 +616,16 @@ function recordCommandRisks(
   if (normalizedExecutable === "xargs") {
     output.risks.push({ kind: "command-carrier", command: normalizedExecutable, text, span });
   }
+  const splitStringFlag = envSplitStringFlag(argv);
+  if (splitStringFlag) {
+    output.risks.push({
+      kind: "command-carrier",
+      command: normalizedExecutable,
+      flag: splitStringFlag,
+      text,
+      span,
+    });
+  }
   if (normalizedExecutable === "eval") {
     output.risks.push({ kind: "eval", text, span });
   }
@@ -424,10 +635,8 @@ function recordCommandRisks(
   if (normalizedExecutable === "alias") {
     output.risks.push({ kind: "alias", text, span });
   }
-  if (SHELL_CARRIER_EXECUTABLES.has(normalizedExecutable)) {
-    const shellIndex = argv.findIndex((arg) =>
-      SHELL_EXECUTABLES.has(normalizeExecutableToken(arg)),
-    );
+  if (!shellWrapper.isWrapper && SHELL_CARRIER_EXECUTABLES.has(normalizedExecutable)) {
+    const shellIndex = argv.findIndex((arg) => isShellWrapperExecutable(arg));
     if (shellIndex >= 0 && shellCommandFlag(argv, shellIndex + 1)) {
       output.risks.push({
         kind: "shell-wrapper-through-carrier",
@@ -491,28 +700,37 @@ function walk(node: TreeSitterNode, output: MutableExplanation, context: Command
     output.risks.push({ kind: "syntax-error", text: node.text, span });
   }
 
-  if (node.type === "command") {
-    const nameNode = commandNameNode(node);
-    if (nameNode) {
-      const argv = argvFromCommand(node, nameNode);
-      if (!argv) {
-        output.risks.push({
-          kind: "dynamic-executable",
-          text: nameNode.text,
-          span: spanFromNode(nameNode),
-        });
-      } else {
-        const step: CommandStep = {
-          context,
-          executable: argv[0] ?? "",
-          argv,
-          text: node.text,
-          span,
-        };
-        if (step.executable) {
-          output.commands.push(step);
-          recordCommandRisks(argv, node.text, span, output);
-        }
+  if (
+    node.type === "command" ||
+    node.type === "declaration_command" ||
+    node.type === "test_command"
+  ) {
+    const nameNode = node.type === "command" ? commandNameNode(node) : null;
+    const parsed =
+      node.type === "command"
+        ? nameNode
+          ? argvFromCommand(node, nameNode)
+          : null
+        : node.type === "declaration_command"
+          ? argvFromDeclarationCommand(node)
+          : argvFromTestCommand(node);
+    if (node.type === "command" && nameNode && !parsed) {
+      output.risks.push({
+        kind: "dynamic-executable",
+        text: nameNode.text,
+        span: spanFromNode(nameNode),
+      });
+    } else if (parsed) {
+      const step: CommandStep = {
+        context,
+        executable: parsed.argv[0] ?? "",
+        argv: parsed.argv,
+        text: node.text,
+        span,
+      };
+      if (step.executable) {
+        output.commands.push(step);
+        recordCommandRisks(parsed.argv, parsed.dynamicArguments, node.text, span, output);
       }
     }
   }
@@ -523,19 +741,23 @@ function walk(node: TreeSitterNode, output: MutableExplanation, context: Command
 
 export async function explainShellCommand(source: string): Promise<CommandExplanation> {
   const tree = await parseBashForCommandExplanation(source);
-  const output: MutableExplanation = {
-    shapes: new Set(),
-    commands: [],
-    risks: [],
-  };
-  walk(tree.rootNode, output, "top-level");
-  const topLevelCommands = output.commands.filter((command) => command.context === "top-level");
-  return {
-    ok: !tree.rootNode.hasError,
-    source,
-    shapes: [...output.shapes],
-    topLevelCommands,
-    nestedCommands: output.commands.filter((command) => command.context !== "top-level"),
-    risks: output.risks,
-  };
+  try {
+    const output: MutableExplanation = {
+      shapes: new Set(),
+      commands: [],
+      risks: [],
+    };
+    walk(tree.rootNode, output, "top-level");
+    const topLevelCommands = output.commands.filter((command) => command.context === "top-level");
+    return {
+      ok: !tree.rootNode.hasError,
+      source,
+      shapes: [...output.shapes],
+      topLevelCommands,
+      nestedCommands: output.commands.filter((command) => command.context !== "top-level"),
+      risks: output.risks,
+    };
+  } finally {
+    tree.delete();
+  }
 }

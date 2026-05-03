@@ -1786,7 +1786,8 @@
       "sharp"
     ],
     "ignoredBuiltDependencies": [
-      "koffi"
+      "koffi",
+      "tree-sitter-bash"
     ],
     "packageExtensions": {
       "@mariozechner/pi-coding-agent": {
