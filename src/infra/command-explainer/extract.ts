@@ -5,6 +5,7 @@ import { normalizeExecutableToken } from "../exec-wrapper-resolution.js";
 import {
   extractShellWrapperCommand,
   isShellWrapperExecutable,
+  POSIX_SHELL_WRAPPERS,
   resolveShellWrapperTransportArgv,
 } from "../shell-wrapper-resolution.js";
 import { parseBashForCommandExplanation } from "./tree-sitter-runtime.js";
@@ -21,11 +22,13 @@ type MutableExplanation = {
   shapes: Set<CommandShape>;
   commands: CommandStep[];
   risks: CommandRisk[];
+  hasParseError: boolean;
 };
 
 type DynamicArgument = {
   index: number;
   text: string;
+  value: string;
   span: SourceSpan;
 };
 
@@ -34,6 +37,13 @@ type CommandArgv = {
   dynamicArguments: DynamicArgument[];
 };
 
+type WalkState = {
+  wrapperPayloadDepth: number;
+};
+
+const MAX_WRAPPER_PAYLOAD_DEPTH = 2;
+
+const PARSEABLE_SHELL_WRAPPERS = new Set<string>(POSIX_SHELL_WRAPPERS);
 const SHELL_CARRIER_EXECUTABLES = new Set(["sudo", "doas", "env", "command", "builtin"]);
 const SOURCE_EXECUTABLES = new Set([".", "source"]);
 
@@ -342,7 +352,12 @@ function argvFromCommand(node: TreeSitterNode, nameNode: TreeSitterNode): Comman
     }
     const value = shellWordValue(child);
     if (value.kind === "dynamic") {
-      dynamicArguments.push({ index: argv.length, text: child.text, span: spanFromNode(child) });
+      dynamicArguments.push({
+        index: argv.length,
+        text: child.text,
+        value: value.value,
+        span: spanFromNode(child),
+      });
     }
     argv.push(value.value);
   }
@@ -366,7 +381,12 @@ function argvFromDeclarationCommand(node: TreeSitterNode): CommandArgv | null {
     }
     const value = shellWordValue(child);
     if (value.kind === "dynamic") {
-      dynamicArguments.push({ index: argv.length, text: child.text, span: spanFromNode(child) });
+      dynamicArguments.push({
+        index: argv.length,
+        text: child.text,
+        value: value.value,
+        span: spanFromNode(child),
+      });
     }
     argv.push(value.value);
   }
@@ -381,7 +401,12 @@ function appendTestCommandArguments(
   if (node.type === "test_operator" || COMMAND_ARGUMENT_NODE_TYPES.has(node.type)) {
     const value = shellWordValue(node);
     if (value.kind === "dynamic") {
-      dynamicArguments.push({ index: argv.length, text: node.text, span: spanFromNode(node) });
+      dynamicArguments.push({
+        index: argv.length,
+        text: node.text,
+        value: value.value,
+        span: spanFromNode(node),
+      });
     }
     argv.push(value.value);
     return;
@@ -495,6 +520,39 @@ function shellCommandFlag(
     }
   }
   return null;
+}
+
+function canParseShellWrapperPayload(transportArgv: string[], commandFlag: string | null): boolean {
+  const shellExecutable = normalizeExecutableToken(transportArgv[0] ?? "");
+  if (!PARSEABLE_SHELL_WRAPPERS.has(shellExecutable)) {
+    return false;
+  }
+  const lowerFlag = commandFlag?.toLowerCase() ?? "";
+  return lowerFlag === "-c" || lowerFlag === "--command" || /^-[^-]*c[^-]*$/i.test(lowerFlag);
+}
+
+function isDynamicPayload(payload: string, dynamicArguments: DynamicArgument[]): boolean {
+  return dynamicArguments.some((argument) => argument.value === payload);
+}
+
+function shellWrapperPayloadForParsing(
+  argv: string[],
+  dynamicArguments: DynamicArgument[],
+): string | null {
+  const shellWrapper = extractShellWrapperCommand(argv);
+  if (
+    !shellWrapper.isWrapper ||
+    !shellWrapper.command ||
+    isDynamicPayload(shellWrapper.command, dynamicArguments)
+  ) {
+    return null;
+  }
+  const transportArgv = resolveShellWrapperTransportArgv(argv) ?? argv;
+  const commandFlag = shellCommandFlag(transportArgv, 1) ?? shellCommandFlag(argv, 1);
+  if (!canParseShellWrapperPayload(transportArgv, commandFlag?.flag ?? null)) {
+    return null;
+  }
+  return shellWrapper.command;
 }
 
 type InlineEvalHit = NonNullable<ReturnType<typeof detectInterpreterInlineEvalArgv>>;
@@ -666,7 +724,12 @@ function recordCommandRisks(
   }
 }
 
-function walk(node: TreeSitterNode, output: MutableExplanation, context: CommandContext): void {
+async function walk(
+  node: TreeSitterNode,
+  output: MutableExplanation,
+  context: CommandContext,
+  state: WalkState,
+): Promise<void> {
   recordShape(node, output);
 
   const span = spanFromNode(node);
@@ -731,11 +794,30 @@ function walk(node: TreeSitterNode, output: MutableExplanation, context: Command
       if (step.executable) {
         output.commands.push(step);
         recordCommandRisks(parsed.argv, parsed.dynamicArguments, node.text, span, output);
+        const wrapperPayload = shellWrapperPayloadForParsing(parsed.argv, parsed.dynamicArguments);
+        if (wrapperPayload && state.wrapperPayloadDepth < MAX_WRAPPER_PAYLOAD_DEPTH) {
+          const wrapperTree = await parseBashForCommandExplanation(wrapperPayload);
+          try {
+            if (wrapperTree.rootNode.hasError) {
+              output.hasParseError = true;
+              output.risks.push({
+                kind: "syntax-error",
+                text: wrapperPayload,
+                span: spanFromNode(wrapperTree.rootNode),
+              });
+            }
+            await walk(wrapperTree.rootNode, output, "wrapper-payload", {
+              wrapperPayloadDepth: state.wrapperPayloadDepth + 1,
+            });
+          } finally {
+            wrapperTree.delete();
+          }
+        }
       }
     }
   }
   for (const child of namedChildren(node)) {
-    walk(child, output, childContext);
+    await walk(child, output, childContext, state);
   }
 }
 
@@ -746,11 +828,12 @@ export async function explainShellCommand(source: string): Promise<CommandExplan
       shapes: new Set(),
       commands: [],
       risks: [],
+      hasParseError: tree.rootNode.hasError,
     };
-    walk(tree.rootNode, output, "top-level");
+    await walk(tree.rootNode, output, "top-level", { wrapperPayloadDepth: 0 });
     const topLevelCommands = output.commands.filter((command) => command.context === "top-level");
     return {
-      ok: !tree.rootNode.hasError,
+      ok: !output.hasParseError,
       source,
       shapes: [...output.shapes],
       topLevelCommands,

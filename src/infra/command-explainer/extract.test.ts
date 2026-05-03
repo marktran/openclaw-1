@@ -143,6 +143,11 @@ describe("command explainer tree-sitter runtime", () => {
     const explanation = await explainShellCommand('bash -lc "echo hi | wc -c"');
 
     expect(explanation.topLevelCommands.map((step) => step.executable)).toEqual(["bash"]);
+    expect(explanation.nestedCommands).toEqual([
+      expect.objectContaining({ context: "wrapper-payload", executable: "echo" }),
+      expect.objectContaining({ context: "wrapper-payload", executable: "wc" }),
+    ]);
+    expect(explanation.shapes).toContain("pipeline");
     expect(explanation.risks).toContainEqual(
       expect.objectContaining({
         kind: "shell-wrapper",
@@ -195,12 +200,30 @@ describe("command explainer tree-sitter runtime", () => {
     );
 
     const dynamicPayload = await explainShellCommand('bash -lc "$CMD"');
+    expect(dynamicPayload.nestedCommands).toEqual([]);
     expect(dynamicPayload.risks).toContainEqual(
       expect.objectContaining({
         kind: "shell-wrapper",
         executable: "bash",
         flag: "-lc",
         payload: "$CMD",
+      }),
+    );
+
+    const invalidPayload = await explainShellCommand("bash -lc 'echo &&'");
+    expect(invalidPayload.ok).toBe(false);
+    expect(invalidPayload.risks).toContainEqual(expect.objectContaining({ kind: "syntax-error" }));
+
+    const powershellPipeline = await explainShellCommand(
+      'pwsh -Command "Get-ChildItem | Select Name"',
+    );
+    expect(powershellPipeline.nestedCommands).toEqual([]);
+    expect(powershellPipeline.risks).toContainEqual(
+      expect.objectContaining({
+        kind: "shell-wrapper",
+        executable: "pwsh",
+        flag: "-Command",
+        payload: "Get-ChildItem | Select Name",
       }),
     );
 
@@ -216,6 +239,9 @@ describe("command explainer tree-sitter runtime", () => {
           kind: "shell-wrapper-through-carrier",
           command: carrier,
         }),
+      );
+      expect(wrapped.nestedCommands).toContainEqual(
+        expect.objectContaining({ context: "wrapper-payload", executable: "id" }),
       );
     }
   });

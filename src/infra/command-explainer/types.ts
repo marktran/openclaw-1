@@ -2,7 +2,8 @@ export type CommandContext =
   | "top-level"
   | "command-substitution"
   | "process-substitution"
-  | "function-definition";
+  | "function-definition"
+  | "wrapper-payload";
 
 export type CommandShape =
   | "pipeline"
