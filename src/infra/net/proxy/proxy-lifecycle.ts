@@ -249,16 +249,6 @@ function restoreNodeHttpStackForProxyLifecycle(): void {
   }
 }
 
-function reapplyActiveProxyRuntime(proxyUrl: string): void {
-  applyProxyEnv(proxyUrl);
-  resetUndiciDispatcherForProxyLifecycle();
-  try {
-    bootstrapNodeHttpStack(proxyUrl);
-  } catch (err) {
-    logWarn(`proxy: failed to refresh node HTTP proxy hooks: ${String(err)}`);
-  }
-}
-
 function restoreInactiveProxyRuntime(snapshot: ProxyEnvSnapshot): void {
   restoreProxyEnv(snapshot);
   resetUndiciDispatcherForProxyLifecycle();
@@ -266,14 +256,7 @@ function restoreInactiveProxyRuntime(snapshot: ProxyEnvSnapshot): void {
   restoreNodeHttpStackForProxyLifecycle();
 }
 
-function restoreAfterFailedProxyActivation(
-  previousActiveProxyUrl: string | undefined,
-  restoreSnapshot: ProxyEnvSnapshot,
-): void {
-  if (previousActiveProxyUrl) {
-    reapplyActiveProxyRuntime(previousActiveProxyUrl);
-    return;
-  }
+function restoreAfterFailedProxyActivation(restoreSnapshot: ProxyEnvSnapshot): void {
   restoreInactiveProxyRuntime(restoreSnapshot);
   baseProxyEnvSnapshot = null;
 }
@@ -283,12 +266,6 @@ function stopActiveProxyRegistration(registration: ActiveManagedProxyRegistratio
     return;
   }
   stopActiveManagedProxyRegistration(registration);
-
-  const nextActiveProxyUrl = getActiveManagedProxyUrl();
-  if (nextActiveProxyUrl) {
-    reapplyActiveProxyRuntime(nextActiveProxyUrl);
-    return;
-  }
 
   const restoreSnapshot = baseProxyEnvSnapshot ?? captureProxyEnv();
   baseProxyEnvSnapshot = null;
@@ -336,7 +313,12 @@ export async function startProxy(config: ProxyConfig | undefined): Promise<Proxy
   }
 
   const proxyUrl = resolveProxyUrl(config);
-  const previousActiveProxyUrl = getActiveManagedProxyUrl();
+  if (getActiveManagedProxyUrl()) {
+    throw new Error(
+      "proxy: cannot activate a managed proxy while another proxy is active; " +
+        "stop the current proxy before changing proxy.proxyUrl.",
+    );
+  }
   baseProxyEnvSnapshot ??= captureProxyEnv();
   const lifecycleBaseEnvSnapshot = baseProxyEnvSnapshot;
   let injectedEnvSnapshot = captureProxyEnv();
@@ -346,9 +328,9 @@ export async function startProxy(config: ProxyConfig | undefined): Promise<Proxy
     injectedEnvSnapshot = injectProxyEnv(proxyUrl);
     forceResetGlobalDispatcher();
     bootstrapNodeHttpStack(proxyUrl);
-    registration = registerActiveManagedProxyUrl(proxyUrl);
+    registration = registerActiveManagedProxyUrl(new URL(proxyUrl));
   } catch (err) {
-    restoreAfterFailedProxyActivation(previousActiveProxyUrl, lifecycleBaseEnvSnapshot);
+    restoreAfterFailedProxyActivation(lifecycleBaseEnvSnapshot);
     throw new Error(`proxy: failed to activate external proxy routing: ${String(err)}`, {
       cause: err,
     });
