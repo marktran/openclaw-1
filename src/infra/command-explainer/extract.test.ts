@@ -147,6 +147,13 @@ describe("command explainer tree-sitter runtime", () => {
       expect.objectContaining({ context: "wrapper-payload", executable: "echo" }),
       expect.objectContaining({ context: "wrapper-payload", executable: "wc" }),
     ]);
+    const [wrappedEcho, wrappedWc] = explanation.nestedCommands;
+    expect(explanation.source.slice(wrappedEcho?.span.startIndex, wrappedEcho?.span.endIndex)).toBe(
+      "echo hi",
+    );
+    expect(explanation.source.slice(wrappedWc?.span.startIndex, wrappedWc?.span.endIndex)).toBe(
+      "wc -c",
+    );
     expect(explanation.shapes).toContain("pipeline");
     expect(explanation.risks).toContainEqual(
       expect.objectContaining({
@@ -243,6 +250,8 @@ describe("command explainer tree-sitter runtime", () => {
       expect(wrapped.nestedCommands).toContainEqual(
         expect.objectContaining({ context: "wrapper-payload", executable: "id" }),
       );
+      const wrappedId = wrapped.nestedCommands.find((step) => step.executable === "id");
+      expect(wrapped.source.slice(wrappedId?.span.startIndex, wrappedId?.span.endIndex)).toBe("id");
     }
   });
 
